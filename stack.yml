@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: State Machine that checks all EC2 instances registered with SSM and sends alerts to MS Teams if actions are needed 
+
+Parameters:
+  MicrosoftTeamsWebhookURL:
+    Description: Microsoft Teams secret for the webhook URL
+    Type: String
+
+Resources:
+  EventBridgeRetrieveConnectionCredentialsScopedAccessPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "EventBridgeRetrieveConnectionCredentialsScopedAccessPolicy"
+      Description: "Allow AWS Step Functions to make an HTTP call with Connection credentials on your behalf."
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Resource:
+              - !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:connection/${EventBridgeAPIConnection}/*"
+            Action:
+              - "events:RetrieveConnectionCredentials"
+            Effect: "Allow"
+            Sid: "RetrieveConnectionCredentials"
+          - Resource:
+              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:events!connection/${EventBridgeAPIConnection}/*"
+            Action:
+              - "secretsmanager:GetSecretValue"
+              - "secretsmanager:DescribeSecret"
+            Effect: "Allow"
+            Sid: "GetAndDescribeSecretValue"
+  IAMManagedPolicyStepFunctionsInvokeHttpEndpointScopedAccess:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: StepFunctionsInvokeHttpEndpointScopedAccessPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Sid: InvokeHttpEndpoint1
+            Action:
+              - states:InvokeHTTPEndpoint
+            Resource:
+              - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*"
+            Condition:
+              StringEquals:
+                states:HTTPEndpoint: 
+                  - !Sub ${MicrosoftTeamsWebhookURL}
+                states:HTTPMethod:
+                  - POST
+  IAMManagedPolicyEventBridgeInvokeStepFunctions:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "IAMManagedPolicyEventBridgeInvokeStepFunctions"
+      Description: ""
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Resource:
+              - !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*"
+            Action:
+              - "states:StartExecution"
+            Effect: "Allow"
+  IAMRoleEventBridgeInvokeStepFunctions:
+    Type: "AWS::IAM::Role"
+    Properties:
+      ManagedPolicyArns:
+        - Ref: "IAMManagedPolicyEventBridgeInvokeStepFunctions"
+      MaxSessionDuration: 3600
+      RoleName: "IAMRoleEventBridgeInvokeStepFunctions-CF"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service: "events.amazonaws.com"
+  SecretEventBridgeAPIConnection:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: A random secret needed to create the AWS::Events::Connection resource
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "notused"}'
+        GenerateStringKey: "password"
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+      Name: EventBridgeAPIConnection
+  EventBridgeAPIConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      AuthorizationType: API_KEY
+      AuthParameters:
+        ApiKeyAuthParameters:
+            ApiKeyName: notused
+            ApiKeyValue: !Ref SecretEventBridgeAPIConnection 
+      Description: Authentication for HTTP endpoints in Step Functions is handled using an EventBridge Connection resource
+      Name: StepFunctionEventBridgeAPIConnection
+  StepFunctionsStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString: |-
+              {
+                "Comment": "List EC2 instances with ComplianceType=Patch, filter NON_COMPLIANT instances, and retrieve their names and IDs",
+                "StartAt": "DescribeInstances",
+                "States": {
+                  "DescribeInstances": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:ec2:describeInstances",
+                    "Parameters": {
+                      "Filters": [
+                        {
+                          "Name": "instance-state-name",
+                          "Values": [
+                            "running"
+                          ]
+                        }
+                      ]
+                    },
+                    "ResultPath": "$.Instances",
+                    "Next": "ExtractInstanceIDs"
+                  },
+                  "ExtractInstanceIDs": {
+                    "Type": "Pass",
+                    "Parameters": {
+                      "InstanceIDs.$": "$.Instances.Reservations[*].Instances[*].InstanceId"
+                    },
+                    "ResultPath": "$",
+                    "Next": "FetchInstanceComplianceData"
+                  },
+                  "FetchInstanceComplianceData": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:ssm:listComplianceItems",
+                    "Parameters": {
+                      "ResourceIds.$": "$.InstanceIDs",
+                      "Filters": [
+                        {
+                          "Key": "ComplianceType",
+                          "Values": [
+                            "Patch"
+                          ]
+                        },
+                        {
+                          "Key": "Status",
+                          "Values": [
+                            "NON_COMPLIANT"
+                          ]
+                        }
+                      ],
+                      "MaxResults": 50
+                    },
+                    "ResultPath": "$.ComplianceData",
+                    "Next": "FilterNONCOMPLIANTInstances"
+                  },
+                  "FilterNONCOMPLIANTInstances": {
+                    "Type": "Pass",
+                    "Parameters": {
+                      "NONCOMPLIANTInstanceIDs.$": "$.ComplianceData.ComplianceItems[*].ResourceId"
+                    },
+                    "ResultPath": "$",
+                    "Next": "CalculateArrayLength"
+                  },
+                  "CalculateArrayLength": {
+                    "Type": "Pass",
+                    "Parameters": {
+                      "ArrayLength": {
+                        "Fn::Size": [
+                          "$.NONCOMPLIANTInstanceIDs"
+                        ]
+                      }
+                    },
+                    "ResultPath": "$",
+                    "Next": "CheckIfInstancesFound"
+                  },
+                  "CheckIfInstancesFound": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.ArrayLength",
+                        "NumericGreaterThan": 0,
+                        "Next": "DescribeTagsForFilteredInstances"
+                      }
+                    ],
+                    "Default": "EndState"
+                  },
+                  "DescribeTagsForFilteredInstances": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:ec2:describeTags",
+                    "Parameters": {
+                      "Filters": [
+                        {
+                          "Name": "resource-type",
+                          "Values": [
+                            "instance"
+                          ]
+                        },
+                        {
+                          "Name": "resource-id",
+                          "Values.$": "$.NONCOMPLIANTInstanceIDs"
+                        },
+                        {
+                          "Name": "key",
+                          "Values": [
+                            "Name"
+                          ]
+                        }
+                      ]
+                    },
+                    "ResultPath": "$.InstanceTags",
+                    "Next": "PrepareNonCompliantInstanceList"
+                  },
+                  "PrepareNonCompliantInstanceList": {
+                    "Type": "Pass",
+                    "InputPath": "$.InstanceTags",
+                    "ResultPath": "$",
+                    "Parameters": {
+                      "Instances": {
+                        "Names.$": "$.Tags[*].Value",
+                        "Ids.$": "$.Tags[*].ResourceId"
+                      }
+                    },
+                    "Next": "CallThirdPartyAPI"
+                  },
+                  "CallThirdPartyAPI": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::http:invoke",
+                    "Parameters": {
+                      "Method": "POST",
+                      "ApiEndpoint": "${MicrosoftTeamsWebhookURL}",
+                      "Authentication": {
+                        "ConnectionArn": "${EventBridgeConnectionArn}"
+                      },
+                      "Headers": {
+                        "Content-Type": "application/json"
+                      },
+                      "RequestBody": {
+                        "text.$": "States.Format('The next EC2 instances have the Non-Compliant status in SSM and might need to be rebooted in order to have all patches installed:\n{}', States.JsonToString($.Instances))"
+                      }
+                    },
+                    "Retry": [
+                      {
+                        "ErrorEquals": [
+                          "States.ALL"
+                        ],
+                        "IntervalSeconds": 1,
+                        "MaxAttempts": 3,
+                        "BackoffRate": 2,
+                        "JitterStrategy": "FULL"
+                      }
+                    ],
+                    "End": true
+                  },
+                  "EndState": {
+                    "Type": "Succeed"
+                  }
+                }
+              }
+
+      DefinitionSubstitutions:
+        MicrosoftTeamsWebhookURL: !Ref MicrosoftTeamsWebhookURL
+        EventBridgeConnectionArn: !GetAtt EventBridgeAPIConnection.Arn
+      LoggingConfiguration:
+        IncludeExecutionData: false
+        Level: "OFF"
+      StateMachineName: "SSMPatchingAlerts"
+      RoleArn:
+        Fn::GetAtt:
+          - "IAMRoleStepFunctionsSSMAlerts"
+          - "Arn"
+      Tags: []
+      StateMachineType: "STANDARD"
+      TracingConfiguration:
+        Enabled: false
+  IAMRoleStepFunctionsSSMAlerts:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: "sts:AssumeRole"
+            Condition:
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*"
+              StringEquals:
+                "aws:SourceAccount": !Sub "${AWS::AccountId}"
+            Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Sid: TrustPolicy1
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+        - "arn:aws:iam::aws:policy/AmazonSSMReadOnlyAccess"
+        - !Ref IAMManagedPolicyStepFunctionsInvokeHttpEndpointScopedAccess
+        - !Ref EventBridgeRetrieveConnectionCredentialsScopedAccessPolicy
+      MaxSessionDuration: 3600
+      RoleName: IAMRoleStepFunctionsSSMAlerts-CF
+    Type: "AWS::IAM::Role"
+  EventsRuleStepFunctionSSMAlerts:
+    Properties:
+      Description: Step Functions trigger event
+      EventBusName: default
+      Name: StepFunctionSSMAlertsCF
+      ScheduleExpression: cron(0 8 ? * 2 *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt
+            - StepFunctionsStateMachine
+            - Arn
+          Id: state-machine
+          RoleArn: !GetAtt IAMRoleEventBridgeInvokeStepFunctions.Arn
+    Type: "AWS::Events::Rule"
